@@ -1,5 +1,6 @@
 import threading
-from tkinter import filedialog, messagebox, VERTICAL
+import time
+from tkinter import filedialog, messagebox
 import customtkinter as ctk
 from gestor_archivos import GestorArchivosLogic
 
@@ -8,7 +9,11 @@ ctk.set_default_color_theme("blue")
 
 class GestorArchivosGUI:
     def __init__(self):
-        self.logic = GestorArchivosLogic(log_callback=self.log, update_ui_callback=self.update_ui)
+        self.logic = GestorArchivosLogic(
+            log_callback=self.log, 
+            update_ui_callback=self.update_ui,
+            error_callback=self.mostrar_error
+        )
         
         self.root = ctk.CTk()
         self.root.title("Gestor de Archivos - Copia sin Duplicados")
@@ -21,27 +26,9 @@ class GestorArchivosGUI:
         self.crear_interfaz()
     
     def crear_interfaz(self):
-        container = ctk.CTkFrame(self.root)
-        container.pack(fill="both", expand=True)
-        
-        canvas = ctk.CTkCanvas(container, highlightthickness=0)
-        canvas.pack(side="left", fill="both", expand=True)
-        
-        scrollbar = ctk.CTkScrollbar(container, orientation=VERTICAL, command=canvas.yview)
-        scrollbar.pack(side="right", fill="y")
-        
-        canvas.configure(yscrollcommand=scrollbar.set)
-        
-        self.main_frame = ctk.CTkFrame(canvas)
-        self.canvas_window = canvas.create_window((0, 0), window=self.main_frame, anchor="nw")
-        
-        def on_frame_configure(event):
-            canvas.configure(scrollregion=canvas.bbox("all"))
-        self.main_frame.bind("<Configure>", on_frame_configure)
-        
-        def on_canvas_resize(event):
-            canvas.itemconfig(self.canvas_window, width=event.width)
-        canvas.bind("<Configure>", on_canvas_resize)
+        # Usar CTkScrollableFrame en lugar de Canvas manual
+        self.main_frame = ctk.CTkScrollableFrame(self.root)
+        self.main_frame.pack(fill="both", expand=True)
         
         self.crear_seccion_carpetas()
         self.crear_seccion_informacion()
@@ -133,15 +120,8 @@ class GestorArchivosGUI:
         
         ctk.CTkLabel(log_frame, text="📝 Registro de Actividad", font=ctk.CTkFont(size=16, weight="bold")).pack(pady=(15, 10))
         
-        texto_scroll_frame = ctk.CTkFrame(log_frame)
-        texto_scroll_frame.pack(fill="both", expand=True, padx=20, pady=(0, 20))
-        
-        self.text_log = ctk.CTkTextbox(texto_scroll_frame, wrap="none")
-        self.text_log.pack(side="left", fill="both", expand=True)
-        
-        log_scrollbar = ctk.CTkScrollbar(texto_scroll_frame, orientation=VERTICAL, command=self.text_log.yview)
-        log_scrollbar.pack(side="right", fill="y")
-        self.text_log.configure(yscrollcommand=log_scrollbar.set)
+        self.text_log = ctk.CTkTextbox(log_frame, wrap="word", height=200)
+        self.text_log.pack(fill="both", expand=True, padx=20, pady=(0, 20))
     
     def seleccionar_origen(self):
         ruta = filedialog.askdirectory()
@@ -158,49 +138,126 @@ class GestorArchivosGUI:
             self.log(f"Carpeta de destino seleccionada: {ruta}")
     
     def contar_archivos_async(self):
-        if not self.logic.ruta_origen:
-            messagebox.showerror("Error", "Selecciona primero la carpeta de origen")
+        """Ejecuta el conteo de archivos en un hilo separado con manejo de errores"""
+        if self.logic.copiando:
+            messagebox.showwarning("Proceso en curso", "Ya hay un proceso en ejecución")
             return
-        threading.Thread(target=self.logic.contar_archivos, daemon=True).start()
+        
+        def wrapper():
+            try:
+                # Deshabilitar botón durante conteo
+                self.root.after(0, lambda: self.btn_contar.configure(state="disabled"))
+                self.logic.contar_archivos()
+            except Exception as e:
+                self.log(f"Error inesperado durante el conteo: {str(e)}")
+                self.mostrar_error(f"Error durante el conteo: {str(e)}")
+            finally:
+                # Siempre rehabilitar el botón
+                self.root.after(0, lambda: self.btn_contar.configure(state="normal"))
+        
+        threading.Thread(target=wrapper, daemon=True).start()
     
     def iniciar_copia(self):
+        """Inicia la copia de archivos con validación y manejo de errores"""
         if self.logic.copiando:
+            messagebox.showwarning("Proceso en curso", "Ya hay un proceso de copia en ejecución")
             return
+        
+        # Validación básica antes de iniciar
         if not self.logic.ruta_origen or not self.logic.ruta_destino:
             messagebox.showerror("Error", "Selecciona las carpetas de origen y destino")
             return
         
-        self.logic.copiando = True
+        def wrapper():
+            try:
+                self.logic.copiando = True
+                # Cambiar estado de botones de forma thread-safe
+                self.root.after(0, self.deshabilitar_botones_copia)
+                
+                self.logic.copiar_archivos()
+                
+            except Exception as e:
+                self.log(f"Error inesperado durante la copia: {str(e)}")
+                self.mostrar_error(f"Error durante la copia: {str(e)}")
+            finally:
+                # Siempre restaurar estado de botones
+                self.root.after(0, self.rehabilitar_botones_copia)
+        
+        threading.Thread(target=wrapper, daemon=True).start()
+    
+    def detener_copia(self):
+        """Detiene la copia de forma segura"""
+        if self.logic.copiando:
+            self.logic.detener_copia()
+            self.log("Solicitando detención del proceso...")
+            # El botón se rehabilitará automáticamente cuando termine el proceso
+    
+    def deshabilitar_botones_copia(self):
+        """Deshabilita botones durante la copia"""
         self.btn_contar.configure(state="disabled")
         self.btn_copiar.configure(state="disabled")
         self.btn_parar.configure(state="normal")
-        
-        threading.Thread(target=self.logic.copiar_archivos, daemon=True).start()
     
-    def detener_copia(self):
-        if self.logic.copiando:
-            self.logic.copiando = False
-            self.log("Parando proceso de copia...")
+    def rehabilitar_botones_copia(self):
+        """Rehabilita botones después de la copia"""
+        self.btn_contar.configure(state="normal")
+        self.btn_copiar.configure(state="normal")
+        self.btn_parar.configure(state="disabled")
     
     def limpiar_log(self):
+        """Limpia el registro de actividad"""
         self.text_log.delete("1.0", "end")
+        self.log("Log limpiado")
     
     def log(self, texto):
+        """Añade una entrada al log con timestamp"""
         timestamp = time.strftime("%H:%M:%S")
-        self.text_log.insert("end", f"[{timestamp}] {texto}\n")
+        mensaje = f"[{timestamp}] {texto}\n"
+        
+        # Insertar de forma thread-safe
+        self.root.after(0, lambda: self._insertar_log(mensaje))
+    
+    def _insertar_log(self, mensaje):
+        """Inserta mensaje en el log (debe ejecutarse en el hilo principal)"""
+        self.text_log.insert("end", mensaje)
         self.text_log.see("end")
+        
+        # Limitar el log a las últimas 1000 líneas para evitar consumo excesivo de memoria
+        lines = self.text_log.get("1.0", "end").split('\n')
+        if len(lines) > 1000:
+            self.text_log.delete("1.0", f"{len(lines)-1000}.0")
     
     def update_ui(self, total, copiados, omitidos, progreso, label_progreso):
-        self.label_total.configure(text=f"Total: {total}")
-        self.label_copiados.configure(text=f"Copiados: {copiados}")
-        self.label_omitidos.configure(text=f"Omitidos: {omitidos}")
-        self.progress_bar.set(progreso)
-        self.label_progreso.configure(text=label_progreso)
-        self.root.update()
+        """Actualiza la interfaz de usuario de forma thread-safe"""
+        def actualizar():
+            self.label_total.configure(text=f"Total: {total}")
+            self.label_copiados.configure(text=f"Copiados: {copiados}")
+            self.label_omitidos.configure(text=f"Omitidos: {omitidos}")
+            self.progress_bar.set(progreso)
+            self.label_progreso.configure(text=label_progreso)
+        
+        # Programar actualización en el hilo principal
+        self.root.after(0, actualizar)
+    
+    def mostrar_error(self, mensaje):
+        """Muestra errores de forma thread-safe"""
+        def mostrar():
+            messagebox.showerror("Error", mensaje)
+        
+        self.root.after(0, mostrar)
     
     def run(self):
-        self.root.mainloop()
+        """Inicia la aplicación"""
+        try:
+            self.root.mainloop()
+        except Exception as e:
+            print(f"Error crítico en la aplicación: {str(e)}")
+            messagebox.showerror("Error Crítico", f"Error crítico en la aplicación: {str(e)}")
 
 if __name__ == "__main__":
-    app = GestorArchivosGUI()
-    app.run()
+    try:
+        app = GestorArchivosGUI()
+        app.run()
+    except Exception as e:
+        print(f"Error al iniciar la aplicación: {str(e)}")
+        messagebox.showerror("Error de Inicio", f"No se pudo iniciar la aplicación: {str(e)}")
